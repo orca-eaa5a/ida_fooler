@@ -9,15 +9,7 @@ import os
 
 import pyx86asm
 
-def write_byte(dst:bytes, src:bytes, write_offset:int)->bytearray:
-    dst = bytearray(dst)
-    src = bytearray(src)
-    idx=0
-    while len(src) > idx:
-        dst[idx+write_offset] = src[idx]
-        idx = idx + 1
-    return (dst)
-
+'''
 def pass_parameter_to_shellcode(shellcode:bytearray, overwritten_api:str, param_offset=0x3E6)->bytearray:
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     dw_str_arr = pyx86asm.chage_pystr_to_dword_array(api_str=overwritten_api)
@@ -40,7 +32,20 @@ def pass_parameter_to_shellcode(shellcode:bytearray, overwritten_api:str, param_
     shellcode_tail = shellcode[param_end_offset:]
 
     return shellcode_head + push_ops + shellcode_tail
+'''
+def formatting_16byte(_data:bytes):
+    if len(_data) % 16 == 0:
+        if len(_data) < 16: 
+            padd_bytes_len = 16 - len(_data)
+        else:
+            padd_bytes_len = 0
+    else:
+        padd_bytes_len = 16 - (len(_data) % 16)
 
+    _data += bytes(padd_bytes_len)
+
+    return _data
+    
 class PETool:
     def __init__(self, fname:str):
         self.fname=fname
@@ -54,7 +59,7 @@ class PETool:
         self.file_alignment = self.pe.OPTIONAL_HEADER.FileAlignment
         self.size_of_img = self.pe.OPTIONAL_HEADER.SizeOfImage
 
-    def get_target_api_name_rva(self, api_name:str)->int:
+    def get_target_api_name_offset(self, api_name:str)->int:
         dir_import = self.pe.DIRECTORY_ENTRY_IMPORT
         for imp in dir_import:
             for api in imp.imports:
@@ -63,21 +68,21 @@ class PETool:
         
         return 0
 
-    def change_import_api(self, dst:str, src:str)->bytes:
-        if len(src) > len(dst):
-            raise Exception("Target API name must shorter than overwritten api")
+    def change_import_api(self, target_api_list:List, disguised_api_list:List)->bytes:
+        for idx in range(len(target_api_list)):
+            disguised_api = disguised_api_list[idx]
+            target_api = target_api_list[idx]
 
-        api_name_rva = self.get_target_api_name_rva(api_name=dst)
-        if api_name_rva == 0:
-            raise Exception("Can not find target api in src file")
-        
-        _bin:bytes = 'b'
-        with open(self.fname, 'rb') as fp:
-            _bin = fp.read()
+            if len(disguised_api) > len(target_api):
+                raise Exception("Target API name must shorter than overwritten api")
+            remain_len = len(target_api) - len(disguised_api)
+            api_name_rva = self.get_target_api_name_offset(api_name=target_api)
+            if api_name_rva == 0:
+                raise Exception("Can not find target api in src file")
+            data = disguised_api.encode("ascii") + bytes(remain_len)
+            self.write_bytes_at_offset(offset=api_name_rva, data=data)
 
-        _bin = write_byte(dst=_bin, src=src.encode("ascii"), write_offset=api_name_rva)
-
-        return _bin
+        pass
 
     def get_section_header_by_name(self, sec_name)->SectionStructure:
         sections:List[pefile.SectionStructure] = self.pe.sections
@@ -115,7 +120,21 @@ class PETool:
 
         return available_size
 
-    def write_bytes_at_offset(self, offset, data):
+    def get_export_api_rva(self, target_api_list:List):
+        offset_list = []
+        try:
+            for api_name in target_api_list:
+                for exp_api in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if exp_api.name.decode("ascii") == api_name:
+                        offset_list.append(exp_api.address)
+                        break
+        except AttributeError as ae:
+            print(ae)
+            exit(-1)
+
+        return  offset_list
+
+    def write_bytes_at_offset(self, offset, data, secure_insert=False):
         number_of_written = 0
         if not isinstance(data, bytes):
             raise TypeError('data should be of type: bytes')
@@ -125,7 +144,16 @@ class PETool:
             self.pe.__data__ = ( self.pe.__data__[:offset] + data + self.pe.__data__[offset+len(data):] )
             number_of_written = len(data)
         else: # Add data at EOF
-            zero_pad = bytes(offset - len(self.pe.__data__))
+            if secure_insert:
+                if offset % self.file_alignment == 0:
+                    if offset < self.file_alignment:
+                        padd_len = self.file_alignment - offset
+                        zero_pad = bytes(padd_len)
+                else:
+                    padd_len = self.file_alignment - (offset % self.file_alignment)
+                    zero_pad = bytes(padd_len)
+            padd_len = offset - len(self.pe.__data__)
+            zero_pad = bytes(padd_len)
             # If insert point(offset) is not equal with EOF, Padding wiht 0
             self.pe.__data__ = self.pe.__data__[:offset] + zero_pad + data
             number_of_written = len(data) + len(zero_pad)
@@ -147,36 +175,54 @@ class Shellcode:
             _bin = fp.read()
             self.shellcode:bytearray = bytearray(_bin)
         self.shellcode_len = 0
+        self.renew_shellcode_len()
+
+    def write(self):
+        with open("./tmp/test_shellcode.bin", "wb") as fp:
+            fp.write(self.shellcode)
 
     def renew_shellcode_len(self):
         self.shellcode_len = len(self.shellcode)
 
-    def set_disguised_api(self, api:str, param_offset=0x3E6):
-        # insert_point : 
-        md = Cs(CS_ARCH_X86, CS_MODE_32)
-        dw_str_arr = pyx86asm.chage_pystr_to_dword_array(api_str=api)
+    def pass_parameters(self, api_set_va, recover_set_va):
+        param_start_offset = self.shellcode.find(b'orca.eaa5a') # Signature
         push_ops = bytearray()
-        for dw_str in dw_str_arr:
-            push_op = pyx86asm.make_push_oper(dw_str)
-            push_ops = push_ops + push_op
-        
-        if not param_offset:
-            for dis in md.disasm(self.shellcode[param_offset:], 0):
-                if dis.mnemonic == "push" and dis.size == 5: # Signature
-                    if struct.unpack("<I",dis.bytes[1:])[0] == 0xEAA5A: # Signature
-                        param_end_offset=param_offset+dis.size
-                        break
-                param_offset = param_offset + dis.size
-        else:
-            param_end_offset = param_offset + 4 # x86 operand size
-            
-        shellcode_head = self.shellcode[:param_offset]
-        shellcode_tail = self.shellcode[param_end_offset:]
 
+        push_op = pyx86asm.make_push_op(oper=recover_set_va)
+        push_ops += push_op
+
+        push_op = pyx86asm.make_push_op(oper=api_set_va)
+        push_ops += push_op
+
+        param_end_offset = param_start_offset + len(b'orca.eaa5a')
+        shellcode_head = self.shellcode[:param_start_offset]
+        shellcode_tail = self.shellcode[param_end_offset:]
         self.shellcode = shellcode_head + push_ops + shellcode_tail
+
         del shellcode_head
         del shellcode_tail
 
         self.renew_shellcode_len()
 
         pass
+        
+
+    def recov_origin_call_offset(self, va, origin_callee_addr):
+        push_ops = bytearray()
+
+        push_op = pyx86asm.make_push_op(origin_callee_addr)
+        push_ops = push_ops + push_op
+
+        push_op = pyx86asm.make_push_op(va)
+        push_ops = push_ops + push_op
+
+        param_start_offset = self.shellcode.find(b'orca-eaa5a') # Signature
+
+        return param_start_offset, push_ops
+
+    def jump_to_origin_control_flow(self, va):
+        mov_op = pyx86asm.make_mov_eax_oper(va)
+
+        param_start_offset = self.shellcode.find(b'EAA5A') # Signature
+
+        return param_start_offset, mov_op
